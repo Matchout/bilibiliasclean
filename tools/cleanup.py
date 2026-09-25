@@ -5,6 +5,13 @@
 阶段2: 删 iOS 全链 / 文档层 / 多语言 / 百度统计全链
 阶段3: UI 精简 —— 防伪弹窗、首页轮播图·公告·更新信息（数据源收敛）、设置·关于程序
 
+ABI 策略（重要）：
+  AGP 不允许 ndk.abiFilters 与 splits.abi 同时包含同一 ABI，否则配置期直接失败：
+    Conflicting configuration : 'arm64-v8a' in ndk abiFilters cannot be present
+    when splits abi filters are set : arm64-v8a
+  因此这里【删掉整个 ndk{} 块】，只保留 splits（release 开启、include 仅 arm64），
+  产物为单一 arm64 split APK，原生库只有 arm64-v8a。
+
 设计要点：
   * 所有匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进（扫出来的代码缩进不可靠）。
   * 删多行块用括号/花括号计数，忽略字符串与 // 注释。
@@ -13,6 +20,7 @@
 """
 import os
 import pathlib
+import re
 import shutil
 import sys
 
@@ -43,6 +51,11 @@ def save(f, ls):
 
 def S(s):
     return s.strip()
+
+
+def compact(s):
+    """去掉所有空白，用于抗 spacing 差异的匹配"""
+    return re.sub(r"\s+", "", s)
 
 
 def deltas(line):
@@ -292,10 +305,13 @@ print("===== phase 1: arm64 only + analytics off =====")
 op_replace_line("gradle.properties", "enabledAnalytics=true", ["enabledAnalytics=false"])
 op_delete_lines("gradle.properties", lambda s: s.startswith("as.baidu.stat.id="),
                 expect=1, label="drop baidu stat id")
-op_replace_line(APP, 'abiFilters += listOf("arm64-v8a", "x86_64")',
-                ['abiFilters += listOf("arm64-v8a")'])
+
 op_replace_line(APP, 'include("arm64-v8a", "x86_64")', ['include("arm64-v8a")'])
 op_replace_line(APP, "isUniversalApk = true", ["isUniversalApk = false"])
+# AGP 不允许 ndk.abiFilters 与 splits.abi 同时含同一 ABI（配置期 EvalIssueException）。
+# 只保留 splits：删掉整个 ndk{} 块。
+op_delete_block(APP, "ndk {", expect=1)
+assert_absent(APP, "abiFilters")
 op_insert_after(APP, 'disable += "Instantiatable"',
                 ["checkReleaseBuilds = false", "abortOnError = false"])
 
@@ -336,7 +352,7 @@ rm(["iosApp", "docs", "fastlane", "ecology", ".github/ISSUE_TEMPLATE",
 rm_locale_dirs("app/src/main/res")
 rm_locale_dirs("shared/src/commonMain/composeResources")
 
-# 百度统计：先删源码引用，再删构建侧
+# 百度统计：先删源码引用，再删构建侧（顺序不能反）
 op_delete_block(BILAPP, "baiduAnalyticsSafe {", expect=1)
 op_delete_lines(BILAPP, lambda s: s == "import com.baidu.mobstat.StatService",
                 expect=1, label="drop StatService import")
@@ -365,7 +381,7 @@ op_delete_lines(APP, lambda s: s.startswith("val baiduStatId"),
                 expect=1, label="drop baiduStatId")
 op_delete_lines(APP, lambda s: s.startswith('manifestPlaceholders["BAIDU_STAT_ID"]'),
                 expect=1, label="drop BAIDU_STAT_ID placeholder")
-op_delete_lines(APP, lambda s: s.startswith('buildConfigField("String", "BAIDU_STAT_ID"'),
+op_delete_lines(APP, lambda s: compact(s).startswith('buildConfigField("String","BAIDU_STAT_ID"'),
                 expect=1, label="drop BAIDU_STAT_ID field")
 op_delete_lines(APP, lambda s: s == "baiduStatDependencies()",
                 expect=1, label="drop baidu deps call")
@@ -403,7 +419,7 @@ assert_absent(HS, "packageSourceWarning")
 # 3-B 首页三块的唯一数据通道关掉
 op_stub_function(HVM, "fun initOldAppInfo()", "    fun initOldAppInfo() = Unit")
 
-# 3-C 默认排版项收敛 + 老存档过滤回写
+# 3-C 默认排版项收敛 + 老存档过滤回写（首页三块与首页排版三项同时消失）
 op_delete_enum_entries(ASR, "private fun createDefaultHomeLayoutItems()",
                        {"AppSettings.HomeLayoutType.Banner,",
                         "AppSettings.HomeLayoutType.Announcement,",
