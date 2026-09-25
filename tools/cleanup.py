@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
-"""bilibilias 个人构建 patch 脚本
+"""bilibilias 个人构建 patch 脚本（完整版）
 
-阶段1: 只出 arm64 + 关闭埋点
-阶段2: 删 iOS 全链 / 文档层 / 多语言 / 百度统计全链
+阶段1: 只出 arm64 + 关闭埋点 + 版本号带 run 号
+阶段2: 删 iOS 全链 / 文档层 / 多语言 / 百度统计全链 / 停用 firebase-perf 注入
 阶段3: UI 精简 —— 防伪弹窗、首页轮播图·公告·更新信息（数据源收敛）、设置·关于程序
 
-ABI 策略（重要）：
-  AGP 不允许 ndk.abiFilters 与 splits.abi 同时包含同一 ABI，否则配置期直接失败：
-    Conflicting configuration : 'arm64-v8a' in ndk abiFilters cannot be present
-    when splits abi filters are set : arm64-v8a
-  因此这里【删掉整个 ndk{} 块】，只保留 splits（release 开启、include 仅 arm64），
-  产物为单一 arm64 split APK，原生库只有 arm64-v8a。
-
-iOS 策略（重要）：
-  删掉 iOS target 后，KSP 的 kspIosArm64 / kspIosSimulatorArm64 配置、iosMain 源集都会
-  消失，任何残留引用都会在配置期炸（Configuration with name 'kspIosArm64' not found）。
-  这里做通用清理 + 收尾硬校验：build 文件里不允许再出现 ios 引用。
+三条硬约束（都是踩过坑的）：
+  1) ABI：AGP 不允许 ndk.abiFilters 与 splits.abi 同时含同一 ABI，会报
+     Conflicting configuration : 'arm64-v8a' in ndk abiFilters cannot be present
+     when splits abi filters are set : arm64-v8a
+     => 删掉整个 ndk{} 块，只留 splits（release 开启、include 仅 arm64）。
+  2) iOS：删掉 iOS target 后 kspIosArm64 / iosMain 等配置与源集会消失，残留引用会报
+     Configuration with name 'kspIosArm64' not found
+     => 通用清理 + 收尾硬校验：build 文件里不允许再出现 ios 引用。
+  3) firebase-perf：该 Gradle 插件会在编译期把 OkHttp/URL 调用点改写成
+     com.google.firebase.perf.network.FirebasePerfOkHttpClient / FirebasePerfUrlConnection，
+     而 enabledAnalytics=false 让 perf 变 compileOnly（不进包）
+     => 首次网络请求 NoClassDefFoundError。必须删掉插件断掉注入。
 
 设计要点：
-  * 所有匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进（扫出来的代码缩进不可靠）。
+  * 匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进。
   * 删多行块用括号/花括号计数，忽略字符串与 // 注释。
   * 匹配数不符立即 ::error:: 退出，绝不静默半改。
   * 每次运行都从干净 checkout 开始，因此不做幂等处理。
@@ -59,7 +60,6 @@ def S(s):
 
 
 def compact(s):
-    """去掉所有空白，用于抗 spacing 差异的匹配"""
     return re.sub(r"\s+", "", s)
 
 
@@ -250,7 +250,6 @@ def op_delete_enum_entries(p, func_prefix, targets):
 
 
 def remove_blocks_quiet(rel, anchor):
-    """删除 rel 里所有以 anchor 整行开头的块；没有匹配则不改文件、不打印。"""
     f, ls = read(rel)
     cnt = 0
     while True:
@@ -266,7 +265,6 @@ def remove_blocks_quiet(rel, anchor):
 
 
 def remove_lines_with_tokens(rel, tokens):
-    """删除 rel 里含任一 token 的非注释行；没有命中则不改文件、不打印。"""
     f, ls = read(rel)
     out = []
     hit = 0
@@ -354,22 +352,87 @@ GRADLE_KTS = [str(p.relative_to(ROOT)) for p in gradle_kts_files()]
 print("gradle kts files -> %s" % GRADLE_KTS)
 
 # ------------------------------------------------------------------ 阶段 1
-print("===== phase 1: arm64 only + analytics off =====")
+print("===== phase 1: arm64 only + analytics off + version stamp =====")
 op_replace_line("gradle.properties", "enabledAnalytics=true", ["enabledAnalytics=false"])
 op_delete_lines("gradle.properties", lambda s: s.startswith("as.baidu.stat.id="),
                 expect=1, label="drop baidu stat id")
 
+# 让产物可自证：versionCode / versionName 带 CI run 号（设置 -> 设备信息 可见）
+op_replace_line(APP, "versionCode = 320",
+                ['versionCode = 320 + (System.getenv("VERSION_CODE") ?: "0").toInt()'])
+op_replace_line(APP, 'versionName = "320"',
+                ['versionName = System.getenv("VERSION_NAME") ?: "320"'])
+
 op_replace_line(APP, 'include("arm64-v8a", "x86_64")', ['include("arm64-v8a")'])
 op_replace_line(APP, "isUniversalApk = true", ["isUniversalApk = false"])
-# AGP 不允许 ndk.abiFilters 与 splits.abi 同时含同一 ABI（配置期 EvalIssueException）。
-# 只保留 splits：删掉整个 ndk{} 块。
+# AGP 不允许 ndk.abiFilters 与 splits.abi 同时含同一 ABI，只保留 splits。
 op_delete_block(APP, "ndk {", expect=1)
 assert_absent(APP, "abiFilters")
 op_insert_after(APP, 'disable += "Instantiatable"',
                 ["checkReleaseBuilds = false", "abortOnError = false"])
 
 # ------------------------------------------------------------------ 阶段 2
-print("===== phase 2: drop iOS / docs / locales / baidu =====")
+print("===== phase 2: iOS / docs / locales / baidu / firebase-perf =====")
+
+# firebase-perf：Gradle 插件会把 OkHttp / URL 调用点改写成
+#   com.google.firebase.perf.network.FirebasePerfOkHttpClient.*
+#   com.google.firebase.perf.network.FirebasePerfUrlConnection.*
+# 而 enabledAnalytics=false 让 perf 变 compileOnly（不进包）=> 首次网络请求即崩。
+op_delete_lines(APP, lambda s: s == "alias(libs.plugins.firebase.perf)",
+                expect=1, label="drop firebase-perf plugin (bytecode injection)")
+assert_absent(APP, "libs.plugins.firebase.perf")
+
+# app 侧 tracer 仍引用 com.google.firebase.perf.*（字段类型等），换成纯空实现。
+write_file("app/src/main/java/com/imcys/bilibilias/common/utils/firebase/FirebaseNetworkPerformanceTracer.kt", '''package com.imcys.bilibilias.common.utils.firebase
+
+import com.imcys.bilibilias.network.plugin.NetworkPerformanceTracer
+
+// 已停用：原实现使用 Firebase Performance（com.google.firebase.perf.*）。
+// 关闭埋点后该 SDK 以 compileOnly 参与编译、不打包进 APK，
+// 保留原实现会在运行时抛 NoClassDefFoundError，这里改为空实现。
+@Suppress("unused")
+class FirebaseNetworkPerformanceTracer(
+    private val trace: Any? = null
+) : NetworkPerformanceTracer {
+
+    override fun onRequest(
+        traceNamePrefix: String,
+        method: String,
+        path: String,
+        requestPayloadSize: Long?,
+    ) {
+    }
+
+    override fun recordSuccess(
+        responseCode: Int,
+        responsePayloadSize: Long?,
+        responseContentType: String?,
+    ) {
+    }
+
+    override fun recordFailure(error: Throwable?) {
+    }
+}
+''')
+
+# 收尾硬校验：build 文件（含 build-logic）里不允许再出现 perf 插件引用
+PERF_TOKENS = ("libs.plugins.firebase.perf", "com.google.firebase.firebase-perf", "firebase-perf")
+PERF_SCAN = list(GRADLE_KTS)
+for dp, dn, fn in os.walk(ROOT / "build-logic"):
+    for f in fn:
+        if f.endswith((".kt", ".kts")):
+            PERF_SCAN.append(str((pathlib.Path(dp) / f).relative_to(ROOT)))
+perf_hits = []
+for rel in sorted(set(PERF_SCAN)):
+    for i, l in enumerate((ROOT / rel).read_text(encoding="utf-8", errors="ignore").split("\n")):
+        s = l.strip()
+        if s.startswith("//") or s.startswith("*"):
+            continue
+        if any(t in s for t in PERF_TOKENS):
+            perf_hits.append("%s:%d: %s" % (rel, i + 1, s))
+if perf_hits:
+    die("firebase-perf still referenced:\n  " + "\n  ".join(perf_hits))
+note("no firebase-perf plugin reference remains in build files")
 
 # iOS(1/3): shared 的 listOf(...).forEach { iosTarget -> ... } 块
 f, ls = read("shared/build.gradle.kts")
@@ -386,7 +449,7 @@ del ls[st:e + 1]
 save(f, ls)
 note("shared/build.gradle.kts: removed ios targets block")
 
-# iOS(2/3): 通用清理 —— 所有模块里残留的 iOS 配置块与引用行
+# iOS(2/3): 通用清理 —— 残留的 iOS 配置块与引用行
 IOS_BLOCKS = ("iosMain.dependencies {", "iosMain {", "iosArm64 {",
               "iosSimulatorArm64 {", "iosX64 {")
 IOS_TOKENS = ("iosArm64", "iosSimulatorArm64", "iosX64", "iosMain",
@@ -400,7 +463,7 @@ for rel in GRADLE_KTS:
 for rel in GRADLE_KTS:
     remove_lines_with_tokens(rel, IOS_TOKENS)
 
-# iOS(3/3): 收尾硬校验 —— build 文件里不允许再出现任何 iOS 引用
+# iOS(3/3): 收尾硬校验
 bad = []
 for rel in GRADLE_KTS:
     for i, l in enumerate((ROOT / rel).read_text(encoding="utf-8").split("\n")):
@@ -463,14 +526,14 @@ op_delete_block(APP, "if (!enabledPlayAppMode.toBoolean() && enabledAnalytics.to
 assert_absent(APP, "bilibilias.baidu.jar")
 assert_absent(APP, "BAIDU_STAT_ID")
 
-write_file("build-logic/convention/src/main/java/BaiduJarDownloadConventionPlugin.kt",
-           "import org.gradle.api.Plugin\n"
-           "import org.gradle.api.Project\n"
-           "\n"
-           "// 已停用：原实现在配置阶段从第三方地址下载百度统计 jar；本项目已移除百度统计。\n"
-           "class BaiduJarDownloadConventionPlugin : Plugin<Project> {\n"
-           "    override fun apply(target: Project) = Unit\n"
-           "}\n")
+write_file("build-logic/convention/src/main/java/BaiduJarDownloadConventionPlugin.kt", '''import org.gradle.api.Plugin
+import org.gradle.api.Project
+
+// 已停用：原实现在配置阶段从第三方地址下载百度统计 jar；本项目已移除百度统计。
+class BaiduJarDownloadConventionPlugin : Plugin<Project> {
+    override fun apply(target: Project) = Unit
+}
+''')
 
 # ------------------------------------------------------------------ 阶段 3
 print("===== phase 3: UI cleanup =====")
@@ -509,7 +572,7 @@ op_replace_line(ASR,
                  "    dataStore.updateData { it.copy(home_layout_typeset = existingList.toList()) }",
                  "}"])
 
-# 3-D 设置 → 关于程序
+# 3-D 设置 -> 关于程序
 op_delete_lines(SS, lambda s: s.startswith('CategorySettingsItem(text = "关于程序"'),
                 expect=1, label="drop about category")
 op_delete_call(SS, 'text = "关于",', "BaseSettingsItem(")
