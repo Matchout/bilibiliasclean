@@ -16,7 +16,10 @@
   3) firebase-perf：该 Gradle 插件会在编译期把 OkHttp/URL 调用点改写成
      com.google.firebase.perf.network.FirebasePerfOkHttpClient / FirebasePerfUrlConnection，
      而 enabledAnalytics=false 让 perf 变 compileOnly（不进包）
-     => 首次网络请求 NoClassDefFoundError。必须删掉插件断掉注入。
+     => 首次网络请求 NoClassDefFoundError。必须删掉 :app 的插件应用以断掉注入。
+
+  注意：根 build.gradle.kts 里 `alias(libs.plugins.firebase.perf) apply false` 必须保留
+  （只声明版本、不 apply，不产生注入），因此 perf 收尾校验要排除 `apply false`。
 
 设计要点：
   * 匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进。
@@ -415,7 +418,7 @@ class FirebaseNetworkPerformanceTracer(
 }
 ''')
 
-# 收尾硬校验：build 文件（含 build-logic）里不允许再出现 perf 插件引用
+# 收尾硬校验：只对「真正 apply」的 perf 插件引用报错；根项目的 `apply false` 版本声明放过
 PERF_TOKENS = ("libs.plugins.firebase.perf", "com.google.firebase.firebase-perf", "firebase-perf")
 PERF_SCAN = list(GRADLE_KTS)
 for dp, dn, fn in os.walk(ROOT / "build-logic"):
@@ -428,11 +431,11 @@ for rel in sorted(set(PERF_SCAN)):
         s = l.strip()
         if s.startswith("//") or s.startswith("*"):
             continue
-        if any(t in s for t in PERF_TOKENS):
+        if any(t in s for t in PERF_TOKENS) and "apply false" not in s:
             perf_hits.append("%s:%d: %s" % (rel, i + 1, s))
 if perf_hits:
     die("firebase-perf still referenced:\n  " + "\n  ".join(perf_hits))
-note("no firebase-perf plugin reference remains in build files")
+note("no firebase-perf plugin reference remains (apply-false declarations ignored)")
 
 # iOS(1/3): shared 的 listOf(...).forEach { iosTarget -> ... } 块
 f, ls = read("shared/build.gradle.kts")
