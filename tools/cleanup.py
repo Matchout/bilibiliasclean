@@ -31,6 +31,7 @@
 设计要点：
   * 匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进。
   * 删多行块用括号/花括号计数，忽略字符串与 // 注释。
+  * Kotlin 参数表/实参表的最后一项常常没有尾逗号 => 这类行一律用 startswith 前缀匹配。
   * 匹配数不符立即 ::error:: 退出，绝不静默半改。
   * 每次运行都从干净 checkout 开始，因此不做幂等处理。
 """
@@ -626,10 +627,10 @@ op_delete_call(LCS, "vm.startSpeedTest()", "item(span = { GridItemSpan(columns) 
 # 4) UI：删每张卡片里的“检测”按钮
 op_delete_call(LCS, "onStartSpeedTest(item)", "ASTextButton(")
 
-# 5) UI：删 LineHostCard 的参数与调用点
-op_delete_lines(LCS, lambda s: s == "onStartSpeedTest: (BILILineHostItem) -> Unit,",
+# 5) UI：删 LineHostCard 的参数与调用点（参数表/实参表最后一项无尾逗号 -> 用前缀匹配）
+op_delete_lines(LCS, lambda s: s.startswith("onStartSpeedTest: (BILILineHostItem) -> Unit"),
                 expect=1, label="drop card param")
-op_delete_lines(LCS, lambda s: s == "onStartSpeedTest = vm::startSpeedTest",
+op_delete_lines(LCS, lambda s: s.startswith("onStartSpeedTest = vm::startSpeedTest"),
                 expect=1, label="drop card param pass")
 
 # 6) UI：删“非自动线路可能不可用”的警告条（只剩默认线路后恒不显示）
