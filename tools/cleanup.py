@@ -4,8 +4,11 @@
 阶段1: 只出 arm64 + 关闭埋点 + 版本号带 run 号
 阶段2: 删 iOS 全链 / 文档层 / 多语言 / 百度统计全链 / 停用 firebase-perf 注入
 阶段3: UI 精简 —— 防伪弹窗、首页轮播图·公告·更新信息（数据源收敛）、设置·关于程序
+阶段4: 线路配置只留「默认线路」+ 历史选择自愈 + 去掉测速入口
+阶段5: 删 google-services / firebase-crashlytics 插件与 google-services.json、
+       manifest 去 firebase_performance_logcat_enabled、allowBackup=false
 
-三条硬约束（都是踩过坑的）：
+四条硬约束（都是踩过坑的）：
   1) ABI：AGP 不允许 ndk.abiFilters 与 splits.abi 同时含同一 ABI，会报
      Conflicting configuration : 'arm64-v8a' in ndk abiFilters cannot be present
      when splits abi filters are set : arm64-v8a
@@ -17,9 +20,13 @@
      com.google.firebase.perf.network.FirebasePerfOkHttpClient / FirebasePerfUrlConnection，
      而 enabledAnalytics=false 让 perf 变 compileOnly（不进包）
      => 首次网络请求 NoClassDefFoundError。必须删掉 :app 的插件应用以断掉注入。
-
-  注意：根 build.gradle.kts 里 `alias(libs.plugins.firebase.perf) apply false` 必须保留
-  （只声明版本、不 apply，不产生注入），因此 perf 收尾校验要排除 `apply false`。
+     注意：根 build.gradle.kts 里的 `alias(libs.plugins.firebase.perf) apply false`
+     必须保留（只声明版本、不 apply，不产生注入），因此收尾校验要排除 apply false。
+  4) gms / crashlytics：google-services 插件在配置期读 app/google-services.json，
+     文件缺失会直接 "File google-services.json is missing." 构建失败；
+     firebase-crashlytics 插件依赖它做 mapping 上传。
+     => 两个插件 alias 与 google-services.json 必须同批删（根项目的 `… apply false` 保留）。
+     这两者是纯构建期插件、不往 dex 注入调用，删除不改变运行时行为。
 
 设计要点：
   * 匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进。
@@ -237,6 +244,19 @@ def op_insert_after(p, anchor_eq, new_lines):
     note("%s: inserted %d line(s) after %r" % (p, len(new_lines), anchor_eq[:40]))
 
 
+def op_regex_sub(p, pattern, repl, expect, label=""):
+    """对整文件做一次 re.S 正则替换；命中数必须等于 expect，否则整步失败。"""
+    f = ROOT / p
+    if not f.exists():
+        die("file not found: %s" % p)
+    txt = f.read_text(encoding="utf-8")
+    new, n = re.subn(pattern, repl, txt, flags=re.S)
+    if n != expect:
+        die("%s %s: regex matched %d, expected %d" % (p, label, n, expect))
+    f.write_text(new, encoding="utf-8")
+    note("%s: regex-sub %d x %s" % (p, n, label))
+
+
 def op_delete_enum_entries(p, func_prefix, targets):
     f, ls = read(p)
     i = find_one(ls, lambda s: s.startswith(func_prefix), p + " :: " + func_prefix)
@@ -345,6 +365,9 @@ ASR = "core/data/src/main/java/com/imcys/bilibilias/data/repository/AppSettingsR
 APP = "app/build.gradle.kts"
 BILAPP = "app/src/main/java/com/imcys/bilibilias/BILIBILIASApplication.kt"
 MAINACT = "app/src/main/java/com/imcys/bilibilias/MainActivity.kt"
+LCVM = "shared/src/commonMain/kotlin/com/imcys/bilibilias/shared/feature/setting/developer/LineConfigViewModel.kt"
+LCS = "shared/src/commonMain/kotlin/com/imcys/bilibilias/shared/feature/setting/developer/LineConfigScreen.kt"
+MANIFEST = "app/src/main/AndroidManifest.xml"
 
 # ------------------------------------------------------------------ pre-flight
 print("===== pre-flight scan =====")
@@ -583,6 +606,56 @@ op_delete_call(SS, 'text = "版本追踪",', "BaseSettingsItem(")
 op_delete_call(SS, 'text = "Github仓库",', "BaseSettingsItem(")
 assert_absent(SS, "关于程序")
 assert_absent(SS, "版本追踪")
+
+# ------------------------------------------------------------------ 阶段 4
+print("===== phase 4: line config -> default only =====")
+
+# 1) 线路列表只留“默认线路”（host=""，即不改写地址）；其余 20 条 upos-sz-mirror* 早已废弃
+op_delete_lines(LCVM,
+                lambda s: s.startswith("BILILineHostItem(") and not s.startswith('BILILineHostItem("默认线路"'),
+                expect=20, label="drop non-default line hosts")
+assert_absent(LCVM, "upos-")
+
+# 2) 历史选择自愈：曾选过非默认线路 -> 写回 ""，否则网络层会继续用废弃 host
+op_insert_after(LCVM, "appSettingsRepository.appSettingsFlow.collect {",
+                ['if ((it.biliLineHost ?: "").isNotEmpty()) appSettingsRepository.updateLineHost("")'])
+
+# 3) UI：删顶部“全量测速”按钮
+op_delete_call(LCS, "vm.startSpeedTest()", "item(span = { GridItemSpan(columns) }) {")
+
+# 4) UI：删每张卡片里的“检测”按钮
+op_delete_call(LCS, "onStartSpeedTest(item)", "ASTextButton(")
+
+# 5) UI：删 LineHostCard 的参数与调用点
+op_delete_lines(LCS, lambda s: s == "onStartSpeedTest: (BILILineHostItem) -> Unit,",
+                expect=1, label="drop card param")
+op_delete_lines(LCS, lambda s: s == "onStartSpeedTest = vm::startSpeedTest",
+                expect=1, label="drop card param pass")
+
+# 6) UI：删“非自动线路可能不可用”的警告条（只剩默认线路后恒不显示）
+op_delete_call(LCS, "ASWarringTip(", "item(span = { GridItemSpan(columns) }) {")
+
+# ------------------------------------------------------------------ 阶段 5
+print("===== phase 5: drop gms/crashlytics plugins, manifest privacy =====")
+
+# google-services 插件必须与 google-services.json 同批删（缺文件会让配置期直接失败）
+op_delete_lines(APP, lambda s: s == "alias(libs.plugins.gms.google.services)",
+                expect=1, label="drop google-services plugin")
+op_delete_lines(APP, lambda s: s == "alias(libs.plugins.firebase.crashlytics)",
+                expect=1, label="drop firebase-crashlytics plugin")
+assert_absent(APP, "libs.plugins.gms.google.services")
+assert_absent(APP, "libs.plugins.firebase.crashlytics")
+rm(["app/google-services.json"])
+
+# Firebase Performance 的 logcat 开关（perf 已整链移除）
+op_regex_sub(MANIFEST,
+             r'\s*<meta-data\s+android:name="firebase_performance_logcat_enabled"[^>]*/>',
+             "", 1, label="drop firebase_performance_logcat_enabled")
+assert_absent(MANIFEST, "firebase_performance_logcat_enabled")
+
+# 备份开关关闭（fullBackupContent / dataExtractionRules 在 allowBackup=false 时被系统忽略，保留无害）
+op_regex_sub(MANIFEST, r'android:allowBackup="true"', 'android:allowBackup="false"',
+             1, label="allowBackup=false")
 
 print("")
 print("===== SUMMARY: %d operation(s) applied =====" % len(DONE))
