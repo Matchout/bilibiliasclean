@@ -12,6 +12,11 @@ ABI 策略（重要）：
   因此这里【删掉整个 ndk{} 块】，只保留 splits（release 开启、include 仅 arm64），
   产物为单一 arm64 split APK，原生库只有 arm64-v8a。
 
+iOS 策略（重要）：
+  删掉 iOS target 后，KSP 的 kspIosArm64 / kspIosSimulatorArm64 配置、iosMain 源集都会
+  消失，任何残留引用都会在配置期炸（Configuration with name 'kspIosArm64' not found）。
+  这里做通用清理 + 收尾硬校验：build 文件里不允许再出现 ios 引用。
+
 设计要点：
   * 所有匹配基于「去掉首尾空白后的整行 / 前缀」，不依赖缩进（扫出来的代码缩进不可靠）。
   * 删多行块用括号/花括号计数，忽略字符串与 // 注释。
@@ -244,6 +249,38 @@ def op_delete_enum_entries(p, func_prefix, targets):
     note("%s: removed %d default entries" % (p, n))
 
 
+def remove_blocks_quiet(rel, anchor):
+    """删除 rel 里所有以 anchor 整行开头的块；没有匹配则不改文件、不打印。"""
+    f, ls = read(rel)
+    cnt = 0
+    while True:
+        hits = find_all(ls, lambda s: s == anchor)
+        if not hits:
+            break
+        e = block_end(ls, hits[0])
+        del ls[hits[0]:e + 1]
+        cnt += 1
+    if cnt:
+        save(f, ls)
+        note("%s: removed %d block(s) %s" % (rel, cnt, anchor))
+
+
+def remove_lines_with_tokens(rel, tokens):
+    """删除 rel 里含任一 token 的非注释行；没有命中则不改文件、不打印。"""
+    f, ls = read(rel)
+    out = []
+    hit = 0
+    for l in ls:
+        s = S(l)
+        if (not s.startswith("//")) and any(t in s for t in tokens):
+            hit += 1
+            continue
+        out.append(l)
+    if hit:
+        save(f, out)
+        note("%s: removed %d iOS reference line(s)" % (rel, hit))
+
+
 def write_file(p, text):
     (ROOT / p).write_text(text, encoding="utf-8")
     note("wrote " + p)
@@ -287,6 +324,19 @@ def scan(token):
     return hits
 
 
+def gradle_kts_files():
+    out = []
+    for dp, dn, fn in os.walk(ROOT):
+        p = pathlib.Path(dp)
+        parts = set(p.relative_to(ROOT).parts) if p != ROOT else set()
+        if parts & {".git", ".gradle", "build"}:
+            continue
+        for f in fn:
+            if f.endswith(".gradle.kts"):
+                out.append(pathlib.Path(dp) / f)
+    return sorted(out)
+
+
 HS = "shared/src/commonMain/kotlin/com/imcys/bilibilias/shared/feature/home/HomeScreen.kt"
 HVM = "shared/src/commonMain/kotlin/com/imcys/bilibilias/shared/feature/home/HomeViewModel.kt"
 SS = "shared/src/commonMain/kotlin/com/imcys/bilibilias/shared/feature/setting/SettingScreen.kt"
@@ -299,6 +349,9 @@ MAINACT = "app/src/main/java/com/imcys/bilibilias/MainActivity.kt"
 print("===== pre-flight scan =====")
 for tok in ("StatService", "baiduAnalyticsSafe", "packageSourceWarning"):
     print("%-22s -> %s" % (tok, scan(tok)))
+
+GRADLE_KTS = [str(p.relative_to(ROOT)) for p in gradle_kts_files()]
+print("gradle kts files -> %s" % GRADLE_KTS)
 
 # ------------------------------------------------------------------ 阶段 1
 print("===== phase 1: arm64 only + analytics off =====")
@@ -318,7 +371,7 @@ op_insert_after(APP, 'disable += "Instantiatable"',
 # ------------------------------------------------------------------ 阶段 2
 print("===== phase 2: drop iOS / docs / locales / baidu =====")
 
-# iOS: shared 的 listOf(...).forEach 块
+# iOS(1/3): shared 的 listOf(...).forEach { iosTarget -> ... } 块
 f, ls = read("shared/build.gradle.kts")
 j = find_one(ls, lambda s: s == ").forEach { iosTarget ->", "shared ios forEach")
 st = None
@@ -333,13 +386,32 @@ del ls[st:e + 1]
 save(f, ls)
 note("shared/build.gradle.kts: removed ios targets block")
 
-# iOS: 其余模块的裸声明
-for m in ("core/common", "core/network", "core/database", "core/datastore",
-          "core/data", "core/ui", "core/datastore-proto"):
-    p = m + "/build.gradle.kts"
-    if (ROOT / p).exists():
-        op_delete_lines(p, lambda s: s in ("iosArm64()", "iosSimulatorArm64()"),
-                        label="ios targets")
+# iOS(2/3): 通用清理 —— 所有模块里残留的 iOS 配置块与引用行
+IOS_BLOCKS = ("iosMain.dependencies {", "iosMain {", "iosArm64 {",
+              "iosSimulatorArm64 {", "iosX64 {")
+IOS_TOKENS = ("iosArm64", "iosSimulatorArm64", "iosX64", "iosMain",
+              "IosArm64", "IosSimulatorArm64", "IosX64",
+              "kspIos", "XCFramework", "iosXcframework")
+
+for rel in GRADLE_KTS:
+    for anchor in IOS_BLOCKS:
+        remove_blocks_quiet(rel, anchor)
+
+for rel in GRADLE_KTS:
+    remove_lines_with_tokens(rel, IOS_TOKENS)
+
+# iOS(3/3): 收尾硬校验 —— build 文件里不允许再出现任何 iOS 引用
+bad = []
+for rel in GRADLE_KTS:
+    for i, l in enumerate((ROOT / rel).read_text(encoding="utf-8").split("\n")):
+        s = l.strip()
+        if s.startswith("//"):
+            continue
+        if re.search(r"[Ii]os(Arm64|SimulatorArm64|X64|Main)|kspIos|XCFramework", s):
+            bad.append("%s:%d: %s" % (rel, i + 1, s))
+if bad:
+    die("iOS references remain in build files:\n  " + "\n  ".join(bad))
+note("no iOS reference remains in any build.gradle.kts")
 
 # 目录删除
 rm(["iosApp", "docs", "fastlane", "ecology", ".github/ISSUE_TEMPLATE",
