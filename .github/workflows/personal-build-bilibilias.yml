@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/personal-build.yml'
+      - 'tools/cleanup.py'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -38,7 +39,7 @@ jobs:
             SIZE=$(stat -c%s "$RUNNER_TEMP/mxjs-debug.jks")
             echo "keystore ready: ${SIZE} bytes"
           else
-            echo "::warning::KEYSTORE_B64 not set -> fallback to debug signing"
+            echo "::warning::KEYSTORE_B64 not set -> fallback to debug signing (cannot update-install)"
           fi
 
       - name: Apply cleanup + patches
@@ -61,6 +62,8 @@ jobs:
 
       - name: Build alpha release (arm64 only)
         env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 320-r${{ github.run_number }}
           ALPHA_KEYSTORE_PASSWORD: ${{ secrets.ALPHA_KEYSTORE_PASSWORD }}
           ALPHA_KEY_ALIAS: ${{ secrets.ALPHA_KEY_ALIAS }}
           ALPHA_KEY_PASSWORD: ${{ secrets.ALPHA_KEY_PASSWORD }}
@@ -91,6 +94,16 @@ jobs:
             echo "arm64-v8a OK"
           fi
 
+          echo "----- perf injection guard -----"
+          unzip -p "$APK" 'classes*.dex' > "$RUNNER_TEMP/all.dex"
+          for TOK in FirebasePerfOkHttpClient FirebasePerfUrlConnection; do
+            if grep -aq "$TOK" "$RUNNER_TEMP/all.dex"; then
+              echo "::error::$TOK still referenced -> firebase-perf plugin patch NOT applied"
+              exit 1
+            fi
+          done
+          echo "no perf instrumentation reference"
+
           echo "----- signature -----"
           find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -maxdepth 2 -name apksigner -type f > "$RUNNER_TEMP/signers.txt" 2>/dev/null || true
           APKSIGNER=$(tail -1 "$RUNNER_TEMP/signers.txt")
@@ -101,9 +114,12 @@ jobs:
             echo "apksigner not found, skip"
           fi
 
+          echo "----- fingerprint -----"
+          sha256sum "$APK"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: bilibilias-alpha-arm64
+          name: bilibilias-alpha-arm64-r${{ github.run_number }}
           path: app/build/outputs/apk/alpha/release/*.apk
           if-no-files-found: error
